@@ -1,15 +1,12 @@
 import os
 import re
-import socket
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+import httpx
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-import requests
 
-app = FastAPI(title="Email Protection & Threat Intelligence API")
+app = FastAPI(title="Email & URL Security Analyzer")
 
-# CORS erlauben, damit das Frontend bei Infomaniak auf das Backend zugreifen kann
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,204 +15,198 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# API Keys aus den Scaleway Environment Variables laden
 VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY", "")
 GREYNOISE_API_KEY = os.getenv("GREYNOISE_API_KEY", "")
+URLSCAN_API_KEY = os.getenv("URLSCAN_API_KEY", "")
+INTELX_API_KEY = os.getenv("INTELX_API_KEY", "")
 
-MULTI_PART_TLDS = {'co.uk', 'gov.uk', 'ac.uk', 'com.de', 'co.at', 'com.au', 'co.jp'}
 
-def unwrap_url(raw_url: str) -> str:
-    current_url = raw_url.strip()
-    if not re.match(r'^https?://', current_url, re.IGNORECASE):
-        current_url = 'http://' + current_url
+def unwrap_safelink(url: str) -> str:
+    """Entpackt Microsoft SafeLinks und generische Tracker-URLs."""
+    parsed = urllib.parse.urlparse(url)
+    if "safelinks.protection.outlook.com" in parsed.netloc:
+        query_params = urllib.parse.parse_qs(parsed.query)
+        if "url" in query_params:
+            return query_params["url"][0]
+    return url
 
-    try:
-        parsed = urllib.parse.urlparse(current_url)
-        if 'safelinks.protection.outlook.com' in parsed.netloc:
-            qs = urllib.parse.parse_qs(parsed.query)
-            if 'url' in qs:
-                return unwrap_url(qs['url'][0])
-        elif 'proofpoint.com' in parsed.netloc:
-            qs = urllib.parse.parse_qs(parsed.query)
-            if 'u' in qs:
-                return unwrap_url(urllib.parse.unquote(qs['u'][0]))
-        elif 'google.com' in parsed.netloc and parsed.path == '/url':
-            qs = urllib.parse.parse_qs(parsed.query)
-            if 'q' in qs:
-                return unwrap_url(qs['q'][0])
-    except Exception:
-        pass
-    return current_url
 
-def follow_redirects(url: str, max_redirects: int = 5) -> list:
-    chain = [url]
-    current = url
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-
-    for _ in range(max_redirects):
+async def resolve_redirects(url: str):
+    """Folgt Weiterleitungen und löst IP/Domain-Daten auf."""
+    chain = []
+    current_url = url
+    async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
         try:
-            res = requests.head(current, headers=headers, allow_redirects=False, timeout=3)
-            if res.status_code in [301, 302, 303, 307, 308] and 'Location' in res.headers:
-                next_url = urllib.parse.urljoin(current, res.headers['Location'])
-                next_url = unwrap_url(next_url)
-                if next_url == current or next_url in chain:
-                    break
-                chain.append(next_url)
-                current = next_url
-            else:
-                break
+            response = await client.get(current_url)
+            for r in response.history:
+                chain.append(str(r.url))
+            chain.append(str(response.url))
+            final_url = str(response.url)
         except Exception:
-            break
-    return chain
+            final_url = current_url
+            chain.append(current_url)
+    return final_url, chain
 
-def parse_domain(hostname: str):
-    parts = hostname.split('.')
-    if len(parts) == 1:
-        return {"subdomain": "", "sld": hostname, "tld": "", "mainDomain": hostname}
-    
-    tld = parts[-1]
-    sld = parts[-2]
-    subparts = parts[:-2]
-    
-    last_two = ".".join(parts[-2:])
-    if last_two in MULTI_PART_TLDS and len(parts) > 2:
-        tld = last_two
-        sld = parts[-3]
-        subparts = parts[:-3]
-        
-    return {
-        "subdomain": ".".join(subparts),
-        "sld": sld,
-        "tld": tld,
-        "mainDomain": f"{sld}.{tld}"
-    }
 
-def resolve_dns(domain: str) -> str:
-    try:
-        return socket.gethostbyname(domain)
-    except Exception:
-        return None
+# --- Threat Intelligence Connectors ---
 
-def check_virustotal(domain: str) -> dict:
+async def check_virustotal(client: httpx.AsyncClient, domain: str):
     if not VIRUSTOTAL_API_KEY:
         return {"status": "skipped", "reason": "Kein API Key hinterlegt"}
     headers = {"x-apikey": VIRUSTOTAL_API_KEY}
+    url = f"https://www.virustotal.com/api/v3/domains/{domain}"
     try:
-        res = requests.get(f"https://www.virustotal.com/api/v3/domains/{domain}", headers=headers, timeout=4)
-        if res.status_code == 200:
-            stats = res.json().get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
-            return {
-                "status": "ok",
-                "malicious": stats.get("malicious", 0),
-                "suspicious": stats.get("suspicious", 0),
-                "harmless": stats.get("harmless", 0)
-            }
+        r = await client.get(url, headers=headers)
+        if r.status_code == 200:
+            stats = r.json().get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+            malicious = stats.get("malicious", 0)
+            return {"status": "ok" if malicious == 0 else "malicious", "malicious_count": malicious, "stats": stats}
+        return {"status": "error", "code": r.status_code}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-    return {"status": "error", "message": f"HTTP {res.status_code}"}
 
-def check_abuseipdb(ip: str) -> dict:
+
+async def check_abuseipdb(client: httpx.AsyncClient, ip: str):
     if not ABUSEIPDB_API_KEY or not ip:
         return {"status": "skipped", "reason": "Kein API Key oder keine IP"}
     headers = {"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"}
+    params = {"ipAddress": ip, "maxAgeInDays": "90"}
     try:
-        res = requests.get(f"https://api.abuseipdb.com/api/v2/check?ipAddress={ip}", headers=headers, timeout=4)
-        if res.status_code == 200:
-            data = res.json().get("data", {})
-            return {
-                "status": "ok",
-                "abuseScore": data.get("abuseConfidenceScore", 0),
-                "reports": data.get("totalReports", 0)
-            }
+        r = await client.get("https://api.abuseipdb.com/api/v2/check", headers=headers, params=params)
+        if r.status_code == 200:
+            data = r.json().get("data", {})
+            score = data.get("abuseConfidenceScore", 0)
+            return {"status": "ok" if score < 20 else "suspicious", "abuse_score": score, "total_reports": data.get("totalReports", 0)}
+        return {"status": "error", "code": r.status_code}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-    return {"status": "error", "message": f"HTTP {res.status_code}"}
 
-def check_greynoise(ip: str) -> dict:
-    if not ip:
-        return {"status": "skipped", "reason": "Keine IP verfügbar"}
-    headers = {"key": GREYNOISE_API_KEY} if GREYNOISE_API_KEY else {}
+
+async def check_greynoise(client: httpx.AsyncClient, ip: str):
+    if not GREYNOISE_API_KEY or not ip:
+        return {"status": "skipped", "reason": "Kein API Key oder keine IP"}
+    headers = {"key": GREYNOISE_API_KEY, "Accept": "application/json"}
     try:
-        url = f"https://api.greynoise.io/v3/community/{ip}"
-        res = requests.get(url, headers=headers, timeout=4)
-        if res.status_code == 200:
-            data = res.json()
-            return {
-                "status": "ok",
-                "noise": data.get("noise", False),
-                "riot": data.get("riot", False),
-                "classification": data.get("classification", "unknown")
-            }
+        r = await client.get(f"https://api.greynoise.io/v3/community/{ip}", headers=headers)
+        if r.status_code == 200:
+            data = r.json()
+            return {"status": "ok", "noise": data.get("noise", False), "riot": data.get("riot", False), "classification": data.get("classification", "unknown")}
+        elif r.status_code == 404:
+            return {"status": "ok", "message": "IP nicht in GreyNoise DB (unverdächtig)"}
+        return {"status": "error", "code": r.status_code}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-    return {"status": "not_found"}
+
+
+async def check_urlscan(client: httpx.AsyncClient, domain: str):
+    if not URLSCAN_API_KEY:
+        return {"status": "skipped", "reason": "Kein API Key hinterlegt"}
+    headers = {"API-Key": URLSCAN_API_KEY, "Content-Type": "application/json"}
+    try:
+        # Erstelle eine Domain-Suchabfrage
+        r = await client.get(f"https://urlscan.io/api/v1/search/?q=domain:{domain}", headers=headers)
+        if r.status_code == 200:
+            results = r.json().get("results", [])
+            total = len(results)
+            malicious_scans = sum(1 for res in results if res.get("verdicts", {}).get("overall", {}).get("malicious", False))
+            return {"status": "ok" if malicious_scans == 0 else "malicious", "total_scans_found": total, "malicious_scans": malicious_scans}
+        return {"status": "error", "code": r.status_code}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+async def check_intelx(client: httpx.AsyncClient, domain: str):
+    if not INTELX_API_KEY:
+        return {"status": "skipped", "reason": "Kein API Key hinterlegt"}
+    headers = {"x-key": INTELX_API_KEY, "Content-Type": "application/json"}
+    payload = {"term": domain, "maxresults": 10, "media": 0, "target": 1}
+    try:
+        r = await client.post("https://2.intelx.io/phonebook/search", headers=headers, json=payload)
+        if r.status_code == 200:
+            return {"status": "ok", "search_id": r.json().get("id"), "message": "Suchauftrag gestartet"}
+        return {"status": "error", "code": r.status_code}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# --- Haupt-Endpoint ---
 
 @app.get("/api/analyze")
-def analyze(url: str = Query(...)):
-    unwrapped = unwrap_url(url)
-    redirect_chain = follow_redirects(unwrapped)
-    final_url = redirect_chain[-1]
-
-    parsed_target = urllib.parse.urlparse(final_url)
-    hostname = parsed_target.hostname or ""
-    domain_components = parse_domain(hostname)
-    main_domain = domain_components["mainDomain"]
+async def analyze(url: str = Query(..., description="Die zu prüfende URL")):
+    unwrapped = unwrap_safelink(url)
+    is_wrapper = unwrapped != url
+    final_url, redirect_chain = await resolve_redirects(unwrapped)
     
-    ip_address = resolve_dns(main_domain)
+    parsed_final = urllib.parse.urlparse(final_url)
+    hostname = parsed_final.hostname or ""
+    
+    parts = hostname.split(".")
+    tld = parts[-1] if len(parts) > 1 else ""
+    sld = parts[-2] if len(parts) > 1 else hostname
+    main_domain = f"{sld}.{tld}" if sld and tld else hostname
 
-    with ThreadPoolExecutor() as executor:
-        future_vt = executor.submit(check_virustotal, main_domain)
-        future_abuse = executor.submit(check_abuseipdb, ip_address)
-        future_gn = executor.submit(check_greynoise, ip_address)
+    # IP-Auflösung (Platzhalter/Fallback)
+    ip_address = ""
+    try:
+        import socket
+        ip_address = socket.gethostbyname(hostname)
+    except Exception:
+        pass
 
-        vt_res = future_vt.result()
-        abuse_res = future_abuse.result()
-        gn_res = future_gn.result()
+    domain_info = {
+        "hostname": hostname,
+        "sld": sld,
+        "tld": tld,
+        "mainDomain": main_domain,
+        "ip": ip_address
+    }
 
-    live_score = 0
-    score_reasons = []
+    # Parallele Abfragen aller 5 Dienste
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        vt_res = await check_virustotal(client, main_domain)
+        abuse_res = await check_abuseipdb(client, ip_address)
+        grey_res = await check_greynoise(client, ip_address)
+        urlscan_res = await check_urlscan(client, main_domain)
+        intelx_res = await check_intelx(client, main_domain)
 
-    if vt_res.get("status") == "ok":
-        mal = vt_res.get("malicious", 0)
-        if mal > 0:
-            live_score += min(mal * 25, 70)
-            score_reasons.append(f"VirusTotal: {mal} Security-Vendor(s) melden Phishing/Malware.")
+    # Simple Score-Berechnung
+    score = 0
+    reasons = []
 
-    if abuse_res.get("status") == "ok":
-        score_val = abuse_res.get("abuseScore", 0)
-        if score_val > 20:
-            live_score += int(score_val * 0.4)
-            score_reasons.append(f"AbuseIPDB Confidence Score liegt bei {score_val}%.")
+    if vt_res.get("malicious_count", 0) > 0:
+        score += 60
+        reasons.append(f"VirusTotal: {vt_res['malicious_count']} Malicious Verdict(s)")
 
-    if gn_res.get("status") == "ok":
-        classification = gn_res.get("classification")
-        if classification == "malicious":
-            live_score += 40
-            score_reasons.append("GreyNoise klassifiziert die Server-IP als bösartig.")
+    if abuse_res.get("abuse_score", 0) > 20:
+        score += 40
+        reasons.append(f"AbuseIPDB Score: {abuse_res['abuse_score']}%")
 
-    live_score = min(live_score, 100)
+    if urlscan_res.get("malicious_scans", 0) > 0:
+        score += 50
+        reasons.append(f"Urlscan.io: {urlscan_res['malicious_scans']} bekannte Malicious Scans")
+
+    if is_wrapper:
+        score += 5
+        reasons.append("Microsoft SafeLink / Redirect Wrapper erkannt")
 
     return {
         "input_url": url,
         "unwrapped_url": unwrapped,
         "final_url": final_url,
         "redirect_chain": redirect_chain,
-        "is_wrapper": url != unwrapped,
-        "domain_info": {
-            "hostname": hostname,
-            "subdomain": domain_components["subdomain"],
-            "sld": domain_components["sld"],
-            "tld": domain_components["tld"],
-            "mainDomain": main_domain,
-            "ip": ip_address
-        },
+        "is_wrapper": is_wrapper,
+        "domain_info": domain_info,
         "live_threat_intel": {
             "virustotal": vt_res,
             "abuseipdb": abuse_res,
-            "greynoise": gn_res
+            "greynoise": grey_res,
+            "urlscan": urlscan_res,
+            "intelx": intelx_res
         },
         "security_score": {
-            "score": live_score,
-            "reasons": score_reasons
+            "score": min(score, 100),
+            "reasons": reasons
         }
     }
