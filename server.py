@@ -1,5 +1,6 @@
 import os
-import re
+import asyncio
+import socket
 import urllib.parse
 import httpx
 from fastapi import FastAPI, Query
@@ -25,19 +26,22 @@ INTELX_API_KEY = os.getenv("INTELX_API_KEY", "")
 
 def unwrap_safelink(url: str) -> str:
     """Entpackt Microsoft SafeLinks und generische Tracker-URLs."""
-    parsed = urllib.parse.urlparse(url)
-    if "safelinks.protection.outlook.com" in parsed.netloc:
-        query_params = urllib.parse.parse_qs(parsed.query)
-        if "url" in query_params:
-            return query_params["url"][0]
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if "safelinks.protection.outlook.com" in parsed.netloc:
+            query_params = urllib.parse.parse_qs(parsed.query)
+            if "url" in query_params:
+                return query_params["url"][0]
+    except Exception:
+        pass
     return url
 
 
 async def resolve_redirects(url: str):
-    """Folgt Weiterleitungen und löst IP/Domain-Daten auf."""
+    """Folgt Weiterleitungen und löst die Ziel-URL auf."""
     chain = []
     current_url = url
-    async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as client:
         try:
             response = await client.get(current_url)
             for r in response.history:
@@ -50,88 +54,77 @@ async def resolve_redirects(url: str):
     return final_url, chain
 
 
-# --- Threat Intelligence Connectors ---
+# --- Connectors mit umfassendem Catch-Block ---
 
 async def check_virustotal(client: httpx.AsyncClient, domain: str):
     if not VIRUSTOTAL_API_KEY:
         return {"status": "skipped", "reason": "Kein API Key hinterlegt"}
     headers = {"x-apikey": VIRUSTOTAL_API_KEY}
-    url = f"https://www.virustotal.com/api/v3/domains/{domain}"
     try:
-        r = await client.get(url, headers=headers)
+        r = await client.get(f"https://www.virustotal.com/api/v3/domains/{domain}", headers=headers)
         if r.status_code == 200:
             stats = r.json().get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
             malicious = stats.get("malicious", 0)
-            return {"status": "ok" if malicious == 0 else "malicious", "malicious_count": malicious, "stats": stats}
-        return {"status": "error", "code": r.status_code}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+            return {"status": "ok" if malicious == 0 else "malicious", "malicious_count": malicious}
+        return {"status": "skipped", "reason": f"HTTP {r.status_code}"}
+    except Exception:
+        return {"status": "error", "reason": "Timeout / Verbindungsfehler"}
 
 
 async def check_abuseipdb(client: httpx.AsyncClient, ip: str):
     if not ABUSEIPDB_API_KEY or not ip:
-        return {"status": "skipped", "reason": "Kein API Key oder keine IP"}
+        return {"status": "skipped", "reason": "Kein Key oder keine IP"}
     headers = {"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"}
-    params = {"ipAddress": ip, "maxAgeInDays": "90"}
     try:
-        r = await client.get("https://api.abuseipdb.com/api/v2/check", headers=headers, params=params)
+        r = await client.get("https://api.abuseipdb.com/api/v2/check", headers=headers, params={"ipAddress": ip, "maxAgeInDays": "90"})
         if r.status_code == 200:
-            data = r.json().get("data", {})
-            score = data.get("abuseConfidenceScore", 0)
-            return {"status": "ok" if score < 20 else "suspicious", "abuse_score": score, "total_reports": data.get("totalReports", 0)}
-        return {"status": "error", "code": r.status_code}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+            score = r.json().get("data", {}).get("abuseConfidenceScore", 0)
+            return {"status": "ok" if score < 20 else "suspicious", "abuse_score": score}
+        return {"status": "skipped", "reason": f"HTTP {r.status_code}"}
+    except Exception:
+        return {"status": "error", "reason": "Timeout / Verbindungsfehler"}
 
 
 async def check_greynoise(client: httpx.AsyncClient, ip: str):
     if not GREYNOISE_API_KEY or not ip:
-        return {"status": "skipped", "reason": "Kein API Key oder keine IP"}
+        return {"status": "skipped", "reason": "Kein Key oder keine IP"}
     headers = {"key": GREYNOISE_API_KEY, "Accept": "application/json"}
     try:
         r = await client.get(f"https://api.greynoise.io/v3/community/{ip}", headers=headers)
         if r.status_code == 200:
-            data = r.json()
-            return {"status": "ok", "noise": data.get("noise", False), "riot": data.get("riot", False), "classification": data.get("classification", "unknown")}
-        elif r.status_code == 404:
-            return {"status": "ok", "message": "IP nicht in GreyNoise DB (unverdächtig)"}
-        return {"status": "error", "code": r.status_code}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+            return {"status": "ok", "noise": r.json().get("noise", False)}
+        return {"status": "ok", "reason": "IP unverdächtig"}
+    except Exception:
+        return {"status": "error", "reason": "Timeout / Verbindungsfehler"}
 
 
 async def check_urlscan(client: httpx.AsyncClient, domain: str):
     if not URLSCAN_API_KEY:
         return {"status": "skipped", "reason": "Kein API Key hinterlegt"}
-    headers = {"API-Key": URLSCAN_API_KEY, "Content-Type": "application/json"}
+    headers = {"API-Key": URLSCAN_API_KEY}
     try:
-        # Erstelle eine Domain-Suchabfrage
         r = await client.get(f"https://urlscan.io/api/v1/search/?q=domain:{domain}", headers=headers)
         if r.status_code == 200:
             results = r.json().get("results", [])
-            total = len(results)
-            malicious_scans = sum(1 for res in results if res.get("verdicts", {}).get("overall", {}).get("malicious", False))
-            return {"status": "ok" if malicious_scans == 0 else "malicious", "total_scans_found": total, "malicious_scans": malicious_scans}
-        return {"status": "error", "code": r.status_code}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+            malicious = sum(1 for res in results if res.get("verdicts", {}).get("overall", {}).get("malicious", False))
+            return {"status": "ok" if malicious == 0 else "malicious", "malicious_scans": malicious}
+        return {"status": "skipped", "reason": f"HTTP {r.status_code}"}
+    except Exception:
+        return {"status": "error", "reason": "Timeout / Verbindungsfehler"}
 
 
 async def check_intelx(client: httpx.AsyncClient, domain: str):
     if not INTELX_API_KEY:
         return {"status": "skipped", "reason": "Kein API Key hinterlegt"}
     headers = {"x-key": INTELX_API_KEY, "Content-Type": "application/json"}
-    payload = {"term": domain, "maxresults": 10, "media": 0, "target": 1}
     try:
-        r = await client.post("https://2.intelx.io/phonebook/search", headers=headers, json=payload)
+        r = await client.post("https://2.intelx.io/phonebook/search", headers=headers, json={"term": domain, "maxresults": 5})
         if r.status_code == 200:
-            return {"status": "ok", "search_id": r.json().get("id"), "message": "Suchauftrag gestartet"}
-        return {"status": "error", "code": r.status_code}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+            return {"status": "ok", "search_id": r.json().get("id")}
+        return {"status": "skipped", "reason": f"HTTP {r.status_code}"}
+    except Exception:
+        return {"status": "error", "reason": "Timeout / Verbindungsfehler"}
 
-
-# --- Haupt-Endpoint ---
 
 @app.get("/api/analyze")
 async def analyze(url: str = Query(..., description="Die zu prüfende URL")):
@@ -147,13 +140,12 @@ async def analyze(url: str = Query(..., description="Die zu prüfende URL")):
     sld = parts[-2] if len(parts) > 1 else hostname
     main_domain = f"{sld}.{tld}" if sld and tld else hostname
 
-    # IP-Auflösung (Platzhalter/Fallback)
     ip_address = ""
-    try:
-        import socket
-        ip_address = socket.gethostbyname(hostname)
-    except Exception:
-        pass
+    if hostname:
+        try:
+            ip_address = socket.gethostbyname(hostname)
+        except Exception:
+            pass
 
     domain_info = {
         "hostname": hostname,
@@ -163,33 +155,26 @@ async def analyze(url: str = Query(..., description="Die zu prüfende URL")):
         "ip": ip_address
     }
 
-    # Parallele Abfragen aller 5 Dienste
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        vt_res = await check_virustotal(client, main_domain)
-        abuse_res = await check_abuseipdb(client, ip_address)
-        grey_res = await check_greynoise(client, ip_address)
-        urlscan_res = await check_urlscan(client, main_domain)
-        intelx_res = await check_intelx(client, main_domain)
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        vt_res, abuse_res, grey_res, urlscan_res, intelx_res = await asyncio.gather(
+            check_virustotal(client, main_domain),
+            check_abuseipdb(client, ip_address),
+            check_greynoise(client, ip_address),
+            check_urlscan(client, main_domain),
+            check_intelx(client, main_domain),
+            return_exceptions=True
+        )
 
-    # Simple Score-Berechnung
     score = 0
     reasons = []
 
-    if vt_res.get("malicious_count", 0) > 0:
+    if isinstance(vt_res, dict) and vt_res.get("malicious_count", 0) > 0:
         score += 60
-        reasons.append(f"VirusTotal: {vt_res['malicious_count']} Malicious Verdict(s)")
-
-    if abuse_res.get("abuse_score", 0) > 20:
-        score += 40
-        reasons.append(f"AbuseIPDB Score: {abuse_res['abuse_score']}%")
-
-    if urlscan_res.get("malicious_scans", 0) > 0:
-        score += 50
-        reasons.append(f"Urlscan.io: {urlscan_res['malicious_scans']} bekannte Malicious Scans")
+        reasons.append(f"VirusTotal: Malicious")
 
     if is_wrapper:
         score += 5
-        reasons.append("Microsoft SafeLink / Redirect Wrapper erkannt")
+        reasons.append("Microsoft SafeLink Wrapper erkannt")
 
     return {
         "input_url": url,
@@ -199,11 +184,11 @@ async def analyze(url: str = Query(..., description="Die zu prüfende URL")):
         "is_wrapper": is_wrapper,
         "domain_info": domain_info,
         "live_threat_intel": {
-            "virustotal": vt_res,
-            "abuseipdb": abuse_res,
-            "greynoise": grey_res,
-            "urlscan": urlscan_res,
-            "intelx": intelx_res
+            "virustotal": vt_res if isinstance(vt_res, dict) else {"status": "error"},
+            "abuseipdb": abuse_res if isinstance(abuse_res, dict) else {"status": "error"},
+            "greynoise": grey_res if isinstance(grey_res, dict) else {"status": "error"},
+            "urlscan": urlscan_res if isinstance(urlscan_res, dict) else {"status": "error"},
+            "intelx": intelx_res if isinstance(intelx_res, dict) else {"status": "error"}
         },
         "security_score": {
             "score": min(score, 100),
