@@ -2,6 +2,7 @@ import os
 import asyncio
 import socket
 import urllib.parse
+import unicodedata
 import httpx
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,7 +55,38 @@ async def resolve_redirects(url: str):
     return final_url, chain
 
 
-# --- Connectors mit umfassendem Catch-Block ---
+def analyze_heuristics(url: str, main_domain: str) -> dict:
+    """Prüft auf verdächtige Zeichen, Typosquatting und Versteck-Taktiken."""
+    heuristics = []
+    score_penalty = 0
+
+    # 1. Homoglyphen / Punycode (IDN) Check
+    if main_domain.startswith("xn--") or any(ord(char) > 127 for char in url):
+        score_penalty += 30
+        heuristics.append("Verdacht auf Homoglyphen-Angriff (Unicode/Punycode-Zeichen im Link)")
+
+    # 2. Bekannte Marken-Imitationen (Typosquatting)
+    target_brands = ["paypal", "microsoft", "google", "apple", "amazon", "sparkasse", "bank"]
+    for brand in target_brands:
+        if brand in main_domain and main_domain != f"{brand}.com" and not main_domain.endswith(f".{brand}.com"):
+            score_penalty += 40
+            heuristics.append(f"Mögliches Typosquatting/Branding-Imitation der Marke '{brand}'")
+
+    # 3. IP-Adresse als Hostname verwendet
+    parts = main_domain.split('.')
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        score_penalty += 20
+        heuristics.append("Direkte IP-Adresse statt Domainname verwendet")
+
+    # 4. Übermäßige Subdomain-Verschachtelung
+    if main_domain.count('.') > 3:
+        score_penalty += 15
+        heuristics.append("Verdächtig viele Subdomains (Versteck-Taktik)")
+
+    return {"penalty": score_penalty, "warnings": heuristics}
+
+
+# --- Threat Intelligence Connectors ---
 
 async def check_virustotal(client: httpx.AsyncClient, domain: str):
     if not VIRUSTOTAL_API_KEY:
@@ -121,6 +153,8 @@ async def check_intelx(client: httpx.AsyncClient, domain: str):
     }
 
 
+# --- Haupt-Endpoint ---
+
 @app.get("/api/analyze")
 async def analyze(url: str = Query(..., description="Die zu prüfende URL")):
     unwrapped = unwrap_safelink(url)
@@ -150,6 +184,10 @@ async def analyze(url: str = Query(..., description="Die zu prüfende URL")):
         "ip": ip_address
     }
 
+    # Heuristischer Risiko-Check
+    heuristic_results = analyze_heuristics(final_url, main_domain)
+
+    # Parallele Abfragen aller Dienste
     async with httpx.AsyncClient(timeout=5.0) as client:
         vt_res, abuse_res, grey_res, urlscan_res, intelx_res = await asyncio.gather(
             check_virustotal(client, main_domain),
@@ -160,16 +198,44 @@ async def analyze(url: str = Query(..., description="Die zu prüfende URL")):
             return_exceptions=True
         )
 
-    score = 0
-    reasons = []
+    threat_intel_data = {
+        "virustotal": vt_res if isinstance(vt_res, dict) else {"status": "error"},
+        "abuseipdb": abuse_res if isinstance(abuse_res, dict) else {"status": "error"},
+        "greynoise": grey_res if isinstance(grey_res, dict) else {"status": "error"},
+        "urlscan": urlscan_res if isinstance(urlscan_res, dict) else {"status": "error"},
+        "intelx": intelx_res if isinstance(intelx_res, dict) else {"status": "error"}
+    }
+
+    # Status der Analyse auswerten
+    total_sources = len(threat_intel_data)
+    successful_sources = sum(1 for res in threat_intel_data.values() if res.get("status") in ["ok", "malicious", "suspicious"])
+    skipped_sources = sum(1 for res in threat_intel_data.values() if res.get("status") == "skipped")
+    failed_sources = sum(1 for res in threat_intel_data.values() if res.get("status") == "error")
+
+    analysis_status = {
+        "state": "completed",
+        "summary": f"{successful_sources} von {total_sources} Threat-Intel Quellen erfolgreich abgefragt",
+        "total_sources": total_sources,
+        "successful_sources": successful_sources,
+        "skipped_sources": skipped_sources,
+        "failed_sources": failed_sources
+    }
+
+    # Score-Berechnung
+    score = heuristic_results["penalty"]
+    reasons = list(heuristic_results["warnings"])
 
     if isinstance(vt_res, dict) and vt_res.get("malicious_count", 0) > 0:
         score += 60
-        reasons.append(f"VirusTotal: Malicious")
+        reasons.append(f"VirusTotal: Malicious Verdict ({vt_res['malicious_count']})")
+
+    if isinstance(abuse_res, dict) and abuse_res.get("abuse_score", 0) > 20:
+        score += 40
+        reasons.append(f"AbuseIPDB Score: {abuse_res['abuse_score']}%")
 
     if is_wrapper:
         score += 5
-        reasons.append("Microsoft SafeLink Wrapper erkannt")
+        reasons.append("Microsoft SafeLink / Redirect Wrapper erkannt")
 
     return {
         "input_url": url,
@@ -178,13 +244,9 @@ async def analyze(url: str = Query(..., description="Die zu prüfende URL")):
         "redirect_chain": redirect_chain,
         "is_wrapper": is_wrapper,
         "domain_info": domain_info,
-        "live_threat_intel": {
-            "virustotal": vt_res if isinstance(vt_res, dict) else {"status": "error"},
-            "abuseipdb": abuse_res if isinstance(abuse_res, dict) else {"status": "error"},
-            "greynoise": grey_res if isinstance(grey_res, dict) else {"status": "error"},
-            "urlscan": urlscan_res if isinstance(urlscan_res, dict) else {"status": "error"},
-            "intelx": intelx_res if isinstance(intelx_res, dict) else {"status": "error"}
-        },
+        "heuristics": heuristic_results,
+        "live_threat_intel": threat_intel_data,
+        "analysis_status": analysis_status,
         "security_score": {
             "score": min(score, 100),
             "reasons": reasons
