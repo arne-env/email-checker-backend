@@ -114,16 +114,11 @@ async def check_urlscan(client: httpx.AsyncClient, domain: str):
 
 
 async def check_intelx(client: httpx.AsyncClient, domain: str):
-    if not INTELX_API_KEY:
-        return {"status": "skipped", "reason": "Kein API Key hinterlegt"}
-    headers = {"x-key": INTELX_API_KEY, "Content-Type": "application/json"}
-    try:
-        r = await client.post("https://2.intelx.io/phonebook/search", headers=headers, json={"term": domain, "maxresults": 5})
-        if r.status_code == 200:
-            return {"status": "ok", "search_id": r.json().get("id")}
-        return {"status": "skipped", "reason": f"HTTP {r.status_code}"}
-    except Exception:
-        return {"status": "error", "reason": "Timeout / Verbindungsfehler"}
+    # Free Tier unterstützt keine API-Abfragen -> sauber überspringen
+    return {
+        "status": "skipped", 
+        "reason": "IntelX API im Free-Tarif nicht verfügbar"
+    }
 
 
 @app.get("/api/analyze")
