@@ -55,41 +55,39 @@ async def resolve_redirects(url: str):
     return final_url, chain
 
 
-def analyze_heuristics(url: str, main_domain: str) -> dict:
-    """Prüft auf verdächtige Zeichen, Typosquatting und Versteck-Taktiken."""
+def analyze_heuristics(url: str, hostname: str) -> dict:
+    """Prüft auf verdächtige Zeichen, Typosquatting und IP-Hostnames."""
     heuristics = []
     score_penalty = 0
 
-    # Domain und URL für die Prüfung in Kleinbuchstaben umwandeln
-    domain_lower = main_domain.lower()
-    url_lower = url.lower()
+    hostname_lower = hostname.lower()
 
-    # 1. Homoglyphen / Punycode (IDN) Check
-    if domain_lower.startswith("xn--") or any(ord(char) > 127 for char in url):
+    # 1. Prüfen, ob der Hostname eine reine IP-Adresse ist
+    ip_parts = hostname.split('.')
+    is_raw_ip = len(ip_parts) == 4 and all(p.isdigit() for p in ip_parts)
+
+    if is_raw_ip:
+        score_penalty += 30
+        heuristics.append("Direkte IP-Adresse als Hostname/Link verwendet (Versteck-Taktik)")
+
+    # 2. Homoglyphen / Punycode (IDN) Check
+    if hostname_lower.startswith("xn--") or any(ord(char) > 127 for char in url):
         score_penalty += 30
         heuristics.append("Verdacht auf Homoglyphen-Angriff (Unicode/Punycode-Zeichen im Link)")
 
-    # 2. Bekannte Marken-Imitationen (Typosquatting & Schreibweisen-Tricks)
-    target_brands = ["paypal", "microsoft", "google", "apple", "amazon", "sparkasse", "bank", "rwe", "swk"]
-    
-    # Ersetze typische Zeichen-Fakes (z. B. 'paypaI' mit 'I' -> 'paypal') für den Match-Test
-    normalized_domain = domain_lower.replace('i', 'l').replace('1', 'l').replace('0', 'o')
+    # 3. Typosquatting Check (nur wenn es KEINE IP ist)
+    if not is_raw_ip:
+        target_brands = ["paypal", "microsoft", "google", "apple", "amazon", "sparkasse", "bank", "swk", "rwe"]
+        normalized_domain = hostname_lower.replace('i', 'l').replace('1', 'l').replace('0', 'o')
 
-    for brand in target_brands:
-        if (brand in domain_lower or brand in normalized_domain) and domain_lower != f"{brand}.com" and not domain_lower.endswith(f".{brand}.com"):
-            score_penalty += 40
-            heuristics.append(f"Mögliches Typosquatting / Branding-Imitation der Marke '{brand}'")
+        for brand in target_brands:
+            if (brand in hostname_lower or brand in normalized_domain) and hostname_lower != f"{brand}.com" and not hostname_lower.endswith(f".{brand}.com"):
+                score_penalty += 40
+                heuristics.append(f"Mögliches Typosquatting / Branding-Imitation der Marke '{brand}'")
 
-    # 3. IP-Adresse als Hostname verwendet
-    parts = main_domain.split('.')
-    if len(parts) == 4 and all(p.isdigit() for p in parts):
-        score_penalty += 20
-        heuristics.append("Direkte IP-Adresse statt Domainname verwendet")
-
-    # 4. Übermäßige Subdomain-Verschachtelung
-    if main_domain.count('.') > 3:
-        score_penalty += 15
-        heuristics.append("Verdächtig viele Subdomains (Versteck-Taktik)")
+        if hostname.count('.') > 3:
+            score_penalty += 15
+            heuristics.append("Verdächtig viele Subdomains (Versteck-Taktik)")
 
     return {"penalty": score_penalty, "warnings": heuristics}
 
@@ -172,17 +170,26 @@ async def analyze(url: str = Query(..., description="Die zu prüfende URL")):
     parsed_final = urllib.parse.urlparse(final_url)
     hostname = parsed_final.hostname or ""
     
-    parts = hostname.split(".")
-    tld = parts[-1] if len(parts) > 1 else ""
-    sld = parts[-2] if len(parts) > 1 else hostname
-    main_domain = f"{sld}.{tld}" if sld and tld else hostname
+    # Prüfen, ob Hostname eine IP-Adresse ist
+    ip_parts = hostname.split('.')
+    is_ip = len(ip_parts) == 4 and all(p.isdigit() for p in ip_parts)
 
-    ip_address = ""
-    if hostname:
-        try:
-            ip_address = socket.gethostbyname(hostname)
-        except Exception:
-            pass
+    if is_ip:
+        main_domain = hostname
+        tld = "IP-Adresse"
+        ip_address = hostname
+        sld = ""
+    else:
+        parts = hostname.split(".")
+        tld = parts[-1] if len(parts) > 1 else ""
+        sld = parts[-2] if len(parts) > 1 else hostname
+        main_domain = f"{sld}.{tld}" if sld and tld else hostname
+        ip_address = ""
+        if hostname:
+            try:
+                ip_address = socket.gethostbyname(hostname)
+            except Exception:
+                pass
 
     domain_info = {
         "hostname": hostname,
@@ -192,13 +199,15 @@ async def analyze(url: str = Query(..., description="Die zu prüfende URL")):
         "ip": ip_address
     }
 
-    # Heuristischer Risiko-Check
-    heuristic_results = analyze_heuristics(final_url, main_domain)
+    # Heuristischer Risiko-Check mit echtem Hostname
+    heuristic_results = analyze_heuristics(final_url, hostname)
 
-    # Parallele Abfragen aller Dienste
+    # Parallele Abfragen aller Dienste (VT wird bei reiner IP übersprungen)
     async with httpx.AsyncClient(timeout=5.0) as client:
+        vt_task = check_virustotal(client, main_domain) if not is_ip else asyncio.sleep(0, result={"status": "skipped", "reason": "VirusTotal erwartet Domain, keine IP"})
+        
         vt_res, abuse_res, grey_res, urlscan_res, intelx_res = await asyncio.gather(
-            check_virustotal(client, main_domain),
+            vt_task,
             check_abuseipdb(client, ip_address),
             check_greynoise(client, ip_address),
             check_urlscan(client, main_domain),
