@@ -62,6 +62,18 @@ def analyze_heuristics(url: str, hostname: str) -> dict:
 
     hostname_lower = hostname.lower()
 
+    # --- OPTION A: Legitime Multi-Tenant SaaS-Domains ignorieren ---
+    trusted_saas_domains = [
+        ".sharepoint.com", 
+        ".onmicrosoft.com", 
+        ".microsoft.com", 
+        ".azurewebsites.net"
+    ]
+    
+    # Wenn die Domain auf eine legitime Enterprise-Plattform endet, Heuristik-Warnungen überspringen
+    if any(hostname_lower.endswith(domain) or hostname_lower == domain.lstrip(".") for domain in trusted_saas_domains):
+        return {"penalty": 0, "warnings": []}
+
     # 1. Prüfen, ob der Hostname eine reine IP-Adresse ist
     ip_parts = hostname.split('.')
     is_raw_ip = len(ip_parts) == 4 and all(p.isdigit() for p in ip_parts)
@@ -77,7 +89,7 @@ def analyze_heuristics(url: str, hostname: str) -> dict:
 
     # 3. Typosquatting Check (nur wenn es KEINE IP ist)
     if not is_raw_ip:
-        target_brands = ["paypal", "microsoft", "google", "apple", "amazon", "sparkasse", "bank", "swk", "rwe"]
+        target_brands = ["paypal", "microsoft", "google", "apple", "amazon", "sparkasse", "bank", "swk"]
         normalized_domain = hostname_lower.replace('i', 'l').replace('1', 'l').replace('0', 'o')
 
         for brand in target_brands:
