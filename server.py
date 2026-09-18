@@ -60,17 +60,25 @@ def analyze_heuristics(url: str, main_domain: str) -> dict:
     heuristics = []
     score_penalty = 0
 
+    # Domain und URL für die Prüfung in Kleinbuchstaben umwandeln
+    domain_lower = main_domain.lower()
+    url_lower = url.lower()
+
     # 1. Homoglyphen / Punycode (IDN) Check
-    if main_domain.startswith("xn--") or any(ord(char) > 127 for char in url):
+    if domain_lower.startswith("xn--") or any(ord(char) > 127 for char in url):
         score_penalty += 30
         heuristics.append("Verdacht auf Homoglyphen-Angriff (Unicode/Punycode-Zeichen im Link)")
 
-    # 2. Bekannte Marken-Imitationen (Typosquatting)
-    target_brands = ["paypal", "microsoft", "google", "apple", "amazon", "sparkasse", "bank"]
+    # 2. Bekannte Marken-Imitationen (Typosquatting & Schreibweisen-Tricks)
+    target_brands = ["paypal", "microsoft", "google", "apple", "amazon", "sparkasse", "bank", "rwe", "swk"]
+    
+    # Ersetze typische Zeichen-Fakes (z. B. 'paypaI' mit 'I' -> 'paypal') für den Match-Test
+    normalized_domain = domain_lower.replace('i', 'l').replace('1', 'l').replace('0', 'o')
+
     for brand in target_brands:
-        if brand in main_domain and main_domain != f"{brand}.com" and not main_domain.endswith(f".{brand}.com"):
+        if (brand in domain_lower or brand in normalized_domain) and domain_lower != f"{brand}.com" and not domain_lower.endswith(f".{brand}.com"):
             score_penalty += 40
-            heuristics.append(f"Mögliches Typosquatting/Branding-Imitation der Marke '{brand}'")
+            heuristics.append(f"Mögliches Typosquatting / Branding-Imitation der Marke '{brand}'")
 
     # 3. IP-Adresse als Hostname verwendet
     parts = main_domain.split('.')
