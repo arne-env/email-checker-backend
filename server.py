@@ -2,13 +2,21 @@ import os
 import asyncio
 import socket
 import urllib.parse
-import unicodedata
 import httpx
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+# Rate Limiter konfigurieren (Max. 10 Anfragen pro Minute pro Client-IP)
+limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(title="Email & URL Security Analyzer")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# CORS Middleware für Anfragen aus dem Frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -53,55 +61,6 @@ async def resolve_redirects(url: str):
             final_url = current_url
             chain.append(current_url)
     return final_url, chain
-
-
-def analyze_heuristics(url: str, hostname: str) -> dict:
-    """Prüft auf verdächtige Zeichen, Typosquatting und IP-Hostnames."""
-    heuristics = []
-    score_penalty = 0
-
-    hostname_lower = hostname.lower()
-
-    # --- OPTION A: Legitime Multi-Tenant SaaS-Domains ignorieren ---
-    trusted_saas_domains = [
-        ".sharepoint.com", 
-        ".onmicrosoft.com", 
-        ".microsoft.com", 
-        ".azurewebsites.net"
-    ]
-    
-    # Wenn die Domain auf eine legitime Enterprise-Plattform endet, Heuristik-Warnungen überspringen
-    if any(hostname_lower.endswith(domain) or hostname_lower == domain.lstrip(".") for domain in trusted_saas_domains):
-        return {"penalty": 0, "warnings": []}
-
-    # 1. Prüfen, ob der Hostname eine reine IP-Adresse ist
-    ip_parts = hostname.split('.')
-    is_raw_ip = len(ip_parts) == 4 and all(p.isdigit() for p in ip_parts)
-
-    if is_raw_ip:
-        score_penalty += 30
-        heuristics.append("Direkte IP-Adresse als Hostname/Link verwendet (Versteck-Taktik)")
-
-    # 2. Homoglyphen / Punycode (IDN) Check
-    if hostname_lower.startswith("xn--") or any(ord(char) > 127 for char in url):
-        score_penalty += 30
-        heuristics.append("Verdacht auf Homoglyphen-Angriff (Unicode/Punycode-Zeichen im Link)")
-
-    # 3. Typosquatting Check (nur wenn es KEINE IP ist)
-    if not is_raw_ip:
-        target_brands = ["paypal", "microsoft", "google", "apple", "amazon", "sparkasse", "bank", "swk"]
-        normalized_domain = hostname_lower.replace('i', 'l').replace('1', 'l').replace('0', 'o')
-
-        for brand in target_brands:
-            if (brand in hostname_lower or brand in normalized_domain) and hostname_lower != f"{brand}.com" and not hostname_lower.endswith(f".{brand}.com"):
-                score_penalty += 40
-                heuristics.append(f"Mögliches Typosquatting / Branding-Imitation der Marke '{brand}'")
-
-        if hostname.count('.') > 3:
-            score_penalty += 15
-            heuristics.append("Verdächtig viele Subdomains (Versteck-Taktik)")
-
-    return {"penalty": score_penalty, "warnings": heuristics}
 
 
 # --- Threat Intelligence Connectors ---
@@ -164,17 +123,15 @@ async def check_urlscan(client: httpx.AsyncClient, domain: str):
 
 
 async def check_intelx(client: httpx.AsyncClient, domain: str):
-    # Free Tier unterstützt keine API-Abfragen -> sauber überspringen
-    return {
-        "status": "skipped", 
-        "reason": "IntelX API im Free-Tarif nicht verfügbar"
-    }
+    # Sauber überspringen aufgrund der Free-Tier-Einschränkungen
+    return {"status": "skipped", "reason": "IntelX API im Free-Tarif nicht verfügbar"}
 
 
-# --- Haupt-Endpoint ---
+# --- Haupt-API Endpunkt ---
 
 @app.get("/api/analyze")
-async def analyze(url: str = Query(..., description="Die zu prüfende URL")):
+@limiter.limit("10/minute")
+async def analyze(request: Request, url: str = Query(..., description="Die zu prüfende URL")):
     unwrapped = unwrap_safelink(url)
     is_wrapper = unwrapped != url
     final_url, redirect_chain = await resolve_redirects(unwrapped)
@@ -182,26 +139,17 @@ async def analyze(url: str = Query(..., description="Die zu prüfende URL")):
     parsed_final = urllib.parse.urlparse(final_url)
     hostname = parsed_final.hostname or ""
     
-    # Prüfen, ob Hostname eine IP-Adresse ist
-    ip_parts = hostname.split('.')
-    is_ip = len(ip_parts) == 4 and all(p.isdigit() for p in ip_parts)
+    parts = hostname.split(".")
+    tld = parts[-1] if len(parts) > 1 else ""
+    sld = parts[-2] if len(parts) > 1 else hostname
+    main_domain = f"{sld}.{tld}" if sld and tld else hostname
 
-    if is_ip:
-        main_domain = hostname
-        tld = "IP-Adresse"
-        ip_address = hostname
-        sld = ""
-    else:
-        parts = hostname.split(".")
-        tld = parts[-1] if len(parts) > 1 else ""
-        sld = parts[-2] if len(parts) > 1 else hostname
-        main_domain = f"{sld}.{tld}" if sld and tld else hostname
-        ip_address = ""
-        if hostname:
-            try:
-                ip_address = socket.gethostbyname(hostname)
-            except Exception:
-                pass
+    ip_address = ""
+    if hostname:
+        try:
+            ip_address = socket.gethostbyname(hostname)
+        except Exception:
+            pass
 
     domain_info = {
         "hostname": hostname,
@@ -211,15 +159,9 @@ async def analyze(url: str = Query(..., description="Die zu prüfende URL")):
         "ip": ip_address
     }
 
-    # Heuristischer Risiko-Check mit echtem Hostname
-    heuristic_results = analyze_heuristics(final_url, hostname)
-
-    # Parallele Abfragen aller Dienste (VT wird bei reiner IP übersprungen)
     async with httpx.AsyncClient(timeout=5.0) as client:
-        vt_task = check_virustotal(client, main_domain) if not is_ip else asyncio.sleep(0, result={"status": "skipped", "reason": "VirusTotal erwartet Domain, keine IP"})
-        
         vt_res, abuse_res, grey_res, urlscan_res, intelx_res = await asyncio.gather(
-            vt_task,
+            check_virustotal(client, main_domain),
             check_abuseipdb(client, ip_address),
             check_greynoise(client, ip_address),
             check_urlscan(client, main_domain),
@@ -227,44 +169,16 @@ async def analyze(url: str = Query(..., description="Die zu prüfende URL")):
             return_exceptions=True
         )
 
-    threat_intel_data = {
-        "virustotal": vt_res if isinstance(vt_res, dict) else {"status": "error"},
-        "abuseipdb": abuse_res if isinstance(abuse_res, dict) else {"status": "error"},
-        "greynoise": grey_res if isinstance(grey_res, dict) else {"status": "error"},
-        "urlscan": urlscan_res if isinstance(urlscan_res, dict) else {"status": "error"},
-        "intelx": intelx_res if isinstance(intelx_res, dict) else {"status": "error"}
-    }
-
-    # Status der Analyse auswerten
-    total_sources = len(threat_intel_data)
-    successful_sources = sum(1 for res in threat_intel_data.values() if res.get("status") in ["ok", "malicious", "suspicious"])
-    skipped_sources = sum(1 for res in threat_intel_data.values() if res.get("status") == "skipped")
-    failed_sources = sum(1 for res in threat_intel_data.values() if res.get("status") == "error")
-
-    analysis_status = {
-        "state": "completed",
-        "summary": f"{successful_sources} von {total_sources} Threat-Intel Quellen erfolgreich abgefragt",
-        "total_sources": total_sources,
-        "successful_sources": successful_sources,
-        "skipped_sources": skipped_sources,
-        "failed_sources": failed_sources
-    }
-
-    # Score-Berechnung
-    score = heuristic_results["penalty"]
-    reasons = list(heuristic_results["warnings"])
+    score = 0
+    reasons = []
 
     if isinstance(vt_res, dict) and vt_res.get("malicious_count", 0) > 0:
         score += 60
-        reasons.append(f"VirusTotal: Malicious Verdict ({vt_res['malicious_count']})")
-
-    if isinstance(abuse_res, dict) and abuse_res.get("abuse_score", 0) > 20:
-        score += 40
-        reasons.append(f"AbuseIPDB Score: {abuse_res['abuse_score']}%")
+        reasons.append("VirusTotal: Malicious")
 
     if is_wrapper:
         score += 5
-        reasons.append("Microsoft SafeLink / Redirect Wrapper erkannt")
+        reasons.append("Microsoft SafeLink Wrapper erkannt")
 
     return {
         "input_url": url,
@@ -273,9 +187,13 @@ async def analyze(url: str = Query(..., description="Die zu prüfende URL")):
         "redirect_chain": redirect_chain,
         "is_wrapper": is_wrapper,
         "domain_info": domain_info,
-        "heuristics": heuristic_results,
-        "live_threat_intel": threat_intel_data,
-        "analysis_status": analysis_status,
+        "live_threat_intel": {
+            "virustotal": vt_res if isinstance(vt_res, dict) else {"status": "error"},
+            "abuseipdb": abuse_res if isinstance(abuse_res, dict) else {"status": "error"},
+            "greynoise": grey_res if isinstance(grey_res, dict) else {"status": "error"},
+            "urlscan": urlscan_res if isinstance(urlscan_res, dict) else {"status": "error"},
+            "intelx": intelx_res if isinstance(intelx_res, dict) else {"status": "error"}
+        },
         "security_score": {
             "score": min(score, 100),
             "reasons": reasons
